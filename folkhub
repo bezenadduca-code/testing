@@ -157,7 +157,7 @@ pcall(function()
     win = ui:CreateWindow({
         Title          = "BetrayalHub",
         Icon           = "sparkles",
-        Author         = "By: Roslie",
+        Author         = " By Mitsuki And Samuel",
         Folder         = "betrayalhub",
         Size           = UDim2.fromOffset(350, 480),
         Transparent    = false,
@@ -2213,10 +2213,7 @@ catSection:Toggle({ Title="Items", Type="Checkbox", Flag="espItems", Default=esp
 catSection:Toggle({ Title="Structures", Type="Checkbox", Flag="espStructures", Default=esp.showStructures,
     Callback=function(on) pcall(function() esp.showStructures=on; if esp.enabled then espClearAll(); espStart() end end) end })
 
--- ============================================================
 -- GROUNDBULB & VINE ESP
--- ============================================================
-
 local secGVEsp = tabESP:Section({ Title = "Groundbulb & Vine Settings", Opened = false })
 
 local gvConfig = {
@@ -3273,6 +3270,71 @@ sec_024:Toggle({
     end
 })
 
+local sec_024b = tabJaneDoe:Section({ Title = "Forever Hold", Opened = true })
+
+sec_024b:Toggle({
+    Title = "Enable Forever Hold",
+    Desc  = "Forces Crystal charge to max (999 past input trick). Max Speed 250.",
+    Flag  = "jdForeverHold",
+    Default = false,
+    Type  = "Checkbox",
+    Callback = function(on)
+        pcall(function()
+            if not jd_enabled then
+                if on then
+                    ui:Notify({
+                        Title = "Jane Doe Disabled",
+                        Content = "Enable 'Jane Doe Aimbot' first, then this.",
+                        Duration = 3,
+                    })
+                    return
+                end
+            end
+            jd_toggleForeverHold(on)
+        end)
+    end
+})
+
+sec_024b:Slider({
+    Title = "Aim Offset (Y)",
+    Flag  = "jdHoldAimOffset",
+    Value = { Min = -5.0, Max = 5.0, Default = jd_AIM_OFFSET },
+    Step  = 0.1,
+    Callback = function(v) jd_AIM_OFFSET = v end
+})
+
+sec_024b:Slider({
+    Title = "Prediction",
+    Flag  = "jdHoldPrediction",
+    Value = { Min = 0.0, Max = 1.0, Default = jd_PREDICTION },
+    Step  = 0.01,
+    Callback = function(v) jd_PREDICTION = v end
+})
+
+sec_024b:Paragraph({
+    Title = "How it works",
+    Desc  = "Sets CrystalFullChargeTime to 999s in the past every tick while active, "
+         .. "so the charge UI reads 100% instantly and MaxSpeed is forced to 250. "
+         .. "Also hooks the CrystalInput RemoteEvent to force max charge on every fire."
+})
+
+sec_024b:Button({
+    Title = "Force Max Charge (One-shot)",
+    Callback = function()
+        pcall(function()
+            local actors = require(svc.RS.Modules.Gameplay.Actors)
+            if not actors then return end
+            local janeActor = actors.CurrentActors[svc.Players.LocalPlayer]
+            if janeActor and janeActor.State then
+                janeActor.State.CrystalFullChargeTime = os.clock() - 999
+                ui:Notify({ Title = "Charged", Content = "Crystal charge forced to max.", Duration = 2 })
+            else
+                ui:Notify({ Title = "No Actor", Content = "You aren't currently Jane Doe.", Duration = 2 })
+            end
+        end)
+    end
+})
+
 local sec_025 = tabJaneDoe:Section({ Title = "Axe Lock-On", Opened = true })
 
 sec_025:Toggle({ 
@@ -3321,11 +3383,7 @@ sec_026:Button({
         jd_enabled = false
         jd_aimbotOn = false
         jd_axeEnabled = false
-        jd_foreverHold = false
-        if jd_foreverHoldThread then
-            task.cancel(jd_foreverHoldThread)
-            jd_foreverHoldThread = nil
-        end
+        pcall(function() jd_toggleForeverHold(false) end)
         jd_removePatch()
         if getgenv()._jdConnection then
             pcall(function() getgenv()._jdConnection:Disconnect() end)
@@ -4172,6 +4230,7 @@ local guestCfg = {
     autoBlockOn = false, blockDelay = 0, detectionRange = 20,
     lineFacingCheck = true, lineLength = 13.5, lineWidth = 3, lineHeight = 6,
     lineOffsetY = -2.5, lineBreakOnBackpedal = true,
+    showLineFacing = false,
     visionRange = 13.5, visionAngle = 85,
     showVisionCone = false, noHDTCooldown = false, hdtCooldownChecker = false,
     blockCooldown = 0.35, autoPunchDelay = 0.3,
@@ -4194,6 +4253,7 @@ local g = {
     centerPart = nil, leftPart = nil, rightPart = nil,
     leftToKillerPart = nil, rightToKillerPart = nil,
     leftToCenterPart = nil, centerToRightPart = nil,
+    lineParts = {},
     pingLabel = nil, hdtCooldownGui = nil, hdtCooldownLabel = nil,
     fpsGui = nil, fpsLabel = nil, cinematicGui = nil,
     lastFpsUpdate = 0, frameCount = 0, fps = 0,
@@ -4217,6 +4277,13 @@ local function g_cleanupVision()
     if g.rightToKillerPart then pcall(function() g.rightToKillerPart:Destroy() end); g.rightToKillerPart = nil end
     if g.leftToCenterPart then pcall(function() g.leftToCenterPart:Destroy() end); g.leftToCenterPart = nil end
     if g.centerToRightPart then pcall(function() g.centerToRightPart:Destroy() end); g.centerToRightPart = nil end
+end
+
+local function g_cleanupLineFacing()
+    for _, part in ipairs(g.lineParts) do
+        pcall(function() part:Destroy() end)
+    end
+    g.lineParts = {}
 end
 
 local function g_cleanupRoundWatcher()
@@ -4243,6 +4310,7 @@ local function g_setupRoundWatcher()
             if not map.Parent then
                 print("[Guest Block] Map removed - cleaning vision")
                 g_cleanupVision()
+                g_cleanupLineFacing()
                 g.roundActive = false
                 task.wait(0.5)
                 g_setupRoundWatcher()
@@ -4580,25 +4648,25 @@ local function g_createConnPart()
 end
 
 local function g_updateVision()
+    -- Vision cone (existing)
     local show = guestCfg.showVisionCone or guestCfg.legacyShowVisionRange
     if not show then
         if g.centerPart then g_cleanupVision() end
-        return
-    end
+    else
     
     if g.centerPart and not g.centerPart.Parent then
         g_cleanupVision()
     end
     
     local root = g_getRoot()
-    if not root then return end
+    if root then
     
     local origin
     if guestCfg.reverseEnabled or guestCfg.legacyFacingEnabled then
         origin = root
     else
         local kf = g_getTeam("Killers")
-        if not kf then return end
+        if kf then
         local targets = {"Slasher","c00lkidd","JohnDoe","1x1x1x1","Noli","Sixer","Nosferatu","Azure"}
         for _, name in ipairs(targets) do
             local t = kf:FindFirstChild(name)
@@ -4607,8 +4675,10 @@ local function g_updateVision()
                 break
             end
         end
-        if not origin then return end
+        end
     end
+    
+    if origin then
     
     local range = guestCfg.legacyShowVisionRange and guestCfg.legacyVisionRange or guestCfg.visionRange
     local angle = guestCfg.legacyShowVisionRange and guestCfg.legacyVisionAngle or guestCfg.visionAngle
@@ -4658,6 +4728,62 @@ local function g_updateVision()
     updateLine(g.rightToKillerPart, origin.Position, rPos)
     updateLine(g.leftToCenterPart, lPos, cPos)
     updateLine(g.centerToRightPart, cPos, rPos)
+    
+    end -- origin
+    end -- root
+    end -- show
+    
+    -- Line Facing debug visual
+    if guestCfg.showLineFacing and guestCfg.lineFacingCheck then
+        local root = g_getRoot()
+        local kf = g_getTeam("Killers")
+        if kf and root then
+            -- hide all existing lineParts first
+            for _, p in ipairs(g.lineParts) do
+                p.Transparency = 1
+            end
+            for _, killer in ipairs(kf:GetChildren()) do
+                local hrp = killer:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local existing = nil
+                    for _, p in ipairs(g.lineParts) do
+                        if p:GetAttribute("KillerName") == killer.Name then
+                            existing = p
+                            break
+                        end
+                    end
+                    if not existing then
+                        existing = Instance.new("Part")
+                        existing.Name = "LineFacingDebug"
+                        existing.Anchored = true
+                        existing.CanCollide = false
+                        existing.CanQuery = false
+                        existing.CanTouch = false
+                        existing.Material = Enum.Material.Neon
+                        existing.Transparency = 0.6
+                        existing.Color = Color3.fromRGB(0, 200, 255)
+                        existing:SetAttribute("KillerName", killer.Name)
+                        existing.Parent = svc.WS
+                        table.insert(g.lineParts, existing)
+                    end
+
+                    local originPos = hrp.Position + Vector3.new(0, guestCfg.lineOffsetY, 0)
+                    local toUs = root.Position - originPos
+                    if toUs.Magnitude > 0.01 then
+                        local lineCF = CFrame.lookAt(originPos, root.Position)
+                        local halfLen = guestCfg.lineLength * 0.5
+                        local midPt = lineCF.Position + lineCF.LookVector * halfLen
+                        existing.Size = Vector3.new(guestCfg.lineWidth, guestCfg.lineHeight, guestCfg.lineLength)
+                        existing.CFrame = CFrame.new(midPt, midPt + lineCF.LookVector)
+                        existing.Transparency = 0.6
+                        existing.Color = Color3.fromRGB(0, 200, 255)
+                    end
+                end
+            end
+        end
+    else
+        if #g.lineParts > 0 then g_cleanupLineFacing() end
+    end
 end
 
 local function g_showCinematicText()
@@ -5235,6 +5361,9 @@ secCore:Slider({ Title="Line Y Offset", Flag="guestLineOffsetY", Step=0.25, Valu
 secCore:Toggle({ Title="Break on Backpedal", Type="Checkbox", Flag="guestLineBreakOnBackpedal", Default=guestCfg.lineBreakOnBackpedal,
     Callback=function(v) guestCfg.lineBreakOnBackpedal=v end })
 
+secCore:Toggle({ Title="Show Line Facing (Debug)", Type="Checkbox", Flag="guestShowLineFacing", Default=false,
+    Callback=function(v) guestCfg.showLineFacing = v; if not v then g_cleanupLineFacing() end end })
+
 secCore:Toggle({ Title="Show Vision Cone", Type="Checkbox", Flag="guestShowVisionCone", Default=guestCfg.showVisionCone,
     Callback=function(v) 
         guestCfg.showVisionCone=v
@@ -5245,6 +5374,14 @@ secCore:Toggle({ Title="Show Vision Cone", Type="Checkbox", Flag="guestShowVisio
             pcall(g_updateVision)
         end
     end })
+
+secCore:Slider({ Title="Vision Cone Range", Flag="guestVisionRange", Step=0.5,
+    Value={Min=1, Max=40, Default=guestCfg.visionRange},
+    Callback=function(v) guestCfg.visionRange=v end })
+
+secCore:Slider({ Title="Vision Cone Angle (°)", Flag="guestVisionAngle", Step=1,
+    Value={Min=1, Max=200, Default=guestCfg.visionAngle},
+    Callback=function(v) guestCfg.visionAngle=v end })
 
 secCore:Toggle({ Title="No HDT Cooldown", Type="Checkbox", Flag="guestNoHDTCooldown", Default=guestCfg.noHDTCooldown,
     Callback=function(v) guestCfg.noHDTCooldown=v end })
@@ -5505,6 +5642,7 @@ secCtrl:Button({ Title="Unload Guest Block", Callback=function()
         if g.aimConnection then g.aimConnection:Disconnect() end
         if g.noclipConn then g.noclipConn:Disconnect() end
         g_cleanupVision()
+        g_cleanupLineFacing()
         g_cleanupRoundWatcher()
         if g.cinematicGui then g.cinematicGui:Destroy() end
         if g.hdtCooldownGui then g.hdtCooldownGui:Destroy() end
@@ -8012,6 +8150,9 @@ function applyConfigFromFlags()
         if type(win.Flags.jdPrediction)=="number" then jd_PREDICTION=win.Flags.jdPrediction end
         if win.Flags.jdAxeEnabled ~= nil then jd_axeEnabled=win.Flags.jdAxeEnabled end
         if type(win.Flags.jdAxeLockDur)=="number" then jd_AXE_LOCK_DURATION=win.Flags.jdAxeLockDur end
+        if win.Flags.jdForeverHold ~= nil then jd_toggleForeverHold(win.Flags.jdForeverHold) end
+        if type(win.Flags.jdHoldAimOffset)=="number" then jd_AIM_OFFSET=win.Flags.jdHoldAimOffset end
+        if type(win.Flags.jdHoldPrediction)=="number" then jd_PREDICTION=win.Flags.jdHoldPrediction end
         if win.Flags.elliotEnabled ~= nil then elliotEnabled=win.Flags.elliotEnabled; if elliotEnabled then elliotStartAimbot() end end
         if win.Flags.elliotRequireAnim ~= nil then elliotRequireAnim=win.Flags.elliotRequireAnim end
         if win.Flags.elliotShowArc ~= nil then elliotShowArc=win.Flags.elliotShowArc end
@@ -8040,7 +8181,10 @@ function applyConfigFromFlags()
         if type(win.Flags.guestLineHeight)=="number" then guestCfg.lineHeight=win.Flags.guestLineHeight end
         if type(win.Flags.guestLineOffsetY)=="number" then guestCfg.lineOffsetY=win.Flags.guestLineOffsetY end
         if win.Flags.guestLineBreakOnBackpedal ~= nil then guestCfg.lineBreakOnBackpedal=win.Flags.guestLineBreakOnBackpedal end
+        if win.Flags.guestShowLineFacing ~= nil then guestCfg.showLineFacing=win.Flags.guestShowLineFacing end
         if win.Flags.guestShowVisionCone ~= nil then guestCfg.showVisionCone=win.Flags.guestShowVisionCone end
+        if type(win.Flags.guestVisionRange)=="number" then guestCfg.visionRange=win.Flags.guestVisionRange end
+        if type(win.Flags.guestVisionAngle)=="number" then guestCfg.visionAngle=win.Flags.guestVisionAngle end
         if win.Flags.guestNoHDTCooldown ~= nil then guestCfg.noHDTCooldown=win.Flags.guestNoHDTCooldown end
         if win.Flags.guestHdtCooldownChecker ~= nil then guestCfg.hdtCooldownChecker=win.Flags.guestHdtCooldownChecker end
         if type(win.Flags.guestBlockCooldown)=="number" then guestCfg.blockCooldown=win.Flags.guestBlockCooldown end
