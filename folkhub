@@ -1672,13 +1672,6 @@ local function aimLock(targetHRP)
     end)
 end
 
-local function aimIsKiller()
-    local char = lp.Character
-    if not char then return false end
-    local killerFolder = getTeamFolder("Killers")
-    return killerFolder ~= nil and char:IsDescendantOf(killerFolder)
-end
-
 local function tryGetAbilityName(args)
     local data = args[2] and args[2][1]
     if not data then return "" end
@@ -2890,12 +2883,16 @@ local jd_Camera = svc.WS.CurrentCamera
 
 local jd_RemoteEvent = nil
 local jd_NetworkRF = nil
+local jd_NetworkModule = nil
 
 pcall(function()
     jd_RemoteEvent = jd_RS:WaitForChild("Modules",10):WaitForChild("Network",10):WaitForChild("Network",10):WaitForChild("RemoteEvent",10)
 end)
 pcall(function()
     jd_NetworkRF = jd_RS:WaitForChild("Modules",10):WaitForChild("Network",10):WaitForChild("Network",10):WaitForChild("RemoteFunction",10)
+end)
+pcall(function()
+    jd_NetworkModule = require(jd_RS.Modules.Network.Network)
 end)
 
 local jd_enabled = false
@@ -2909,103 +2906,146 @@ local jd_AXE_LOCK_DURATION = 1.7
 local jd_axeLocked = false
 local jd_killerMotionData = {}
 
+-- ============================================================
+-- INSTA THROW
+-- Press Crystal → force CrystalFullChargeTime into the far past
+-- every frame while equipped → the game's own heartbeat sees
+-- charge >= 100% AND MaximumHoldTime already satisfied → fires
+-- release on the next frame at full power. Instant max throw.
+-- ============================================================
+local jd_instaThrow = false
+local jd_instaThrowConn = nil
+
+-- ============================================================
+-- FOREVER HOLD (reworked)
+-- Spams CrystalFullChargeTime = os.clock() - 999 so the charge
+-- bar reads 100% forever, AND swallows outgoing CrystalInput
+-- fires through Network.FireServerConnection so the game's own
+-- release loop can never actually fire. Toggle off = next game
+-- release goes through at 100% and you throw.
+-- ============================================================
 local jd_foreverHold = false
 local jd_foreverHoldThread = nil
+local jd_foreverHoldHookInstalled = false
+local jd_originalFireServerConnection = nil
 
-local function jd_overrideCrystalValues()
-    pcall(function()
-        local actors = require(svc.RS.Modules.Gameplay.Actors)
-        if not actors then return end
-        
-        local janeActor = actors.CurrentActors[svc.Players.LocalPlayer]
-        if not janeActor then return end
-        
-        if janeActor.Config and janeActor.Config.Crystal then
-            janeActor.Config.Crystal.MinChargeTime = 0.01
-            janeActor.Config.Crystal.MaxChargeTime = 0.05
-            janeActor.Config.Crystal.ChannelTime = 0.01
-            janeActor.Config.Crystal.ChargeSpeedMult = 100
-            janeActor.Config.Crystal.MaxSpeed = 250
-            janeActor.Config.Crystal.MinSpeed = 250
-            print("[Jane Doe] ⚡ Forever Hold - MAX SPEED 250!")
-        end
-    end)
+local function jd_getJaneActor()
+    local ok, actors = pcall(function() return require(jd_RS.Modules.Gameplay.Actors) end)
+    if not ok or not actors then return nil end
+    return actors.CurrentActors and actors.CurrentActors[jd_lp]
 end
 
 local function jd_forceMaxCharge()
     pcall(function()
-        local actors = require(svc.RS.Modules.Gameplay.Actors)
-        if not actors then return end
-        
-        local janeActor = actors.CurrentActors[svc.Players.LocalPlayer]
-        if not janeActor then return end
-        
-        if janeActor.State then
-            janeActor.State.CrystalFullChargeTime = os.clock() - 999
+        local actor = jd_getJaneActor()
+        if actor and actor.State then
+            actor.State.CrystalFullChargeTime = os.clock() - 999
         end
     end)
 end
 
-local function jd_toggleForeverHold(on)
-    jd_foreverHold = on
-    
-    if on then
-        print("[Jane Doe] 🚀 Forever Hold ENABLED - 999 past input trick ACTIVE (Max Speed: 250)")
-        jd_overrideCrystalValues()
-        
-        if jd_foreverHoldThread then
-            task.cancel(jd_foreverHoldThread)
-            jd_foreverHoldThread = nil
+local function jd_instaThrowStart()
+    if jd_instaThrowConn then jd_instaThrowConn:Disconnect(); jd_instaThrowConn = nil end
+    jd_instaThrowConn = jd_Run.Heartbeat:Connect(function()
+        if not jd_instaThrow then return end
+        local actor = jd_getJaneActor()
+        if not actor or not actor.State then return end
+        if actor.State.IsCrystalEquipped == true then
+            actor.State.CrystalFullChargeTime = os.clock() - 999
         end
-        
-        jd_foreverHoldThread = task.spawn(function()
-            while jd_foreverHold do
-                pcall(function()
-                    jd_forceMaxCharge()
-                    
-                    local playerGui = svc.Players.LocalPlayer.PlayerGui
-                    if playerGui then
-                        local tempUI = playerGui:FindFirstChild("TemporaryUI")
-                        if tempUI then
-                            local chargeUI = tempUI:FindFirstChild("ChargeUI")
-                            if chargeUI then
-                                local bar = chargeUI:FindFirstChild("Bar")
-                                if bar then
-                                    local percent = bar:FindFirstChild("Percent")
-                                    if percent then
-                                        percent.Text = "100%"
-                                    end
-                                    bar.ImageColor3 = Color3.fromRGB(0, 255, 0)
-                                end
-                            end
-                        end
-                    end
-                end)
-                task.wait(0.05)
-            end
-        end)
-    else
-        print("[Jane Doe] ❌ Forever Hold DISABLED")
-        if jd_foreverHoldThread then
-            task.cancel(jd_foreverHoldThread)
-            jd_foreverHoldThread = nil
+    end)
+end
+
+local function jd_instaThrowStop()
+    if jd_instaThrowConn then jd_instaThrowConn:Disconnect(); jd_instaThrowConn = nil end
+end
+
+local function jd_installForeverHoldHook()
+    if jd_foreverHoldHookInstalled then return end
+    local net = jd_NetworkModule
+    if not net or type(net.FireServerConnection) ~= "function" then return end
+    jd_originalFireServerConnection = net.FireServerConnection
+    net.FireServerConnection = function(self, name, channel, ...)
+        if jd_foreverHold and type(name) == "string" and name:match("CrystalInput$") then
+            return
         end
-        
-        pcall(function()
-            local actors = require(svc.RS.Modules.Gameplay.Actors)
-            if not actors then return end
-            
-            local janeActor = actors.CurrentActors[svc.Players.LocalPlayer]
-            if janeActor and janeActor.Config and janeActor.Config.Crystal then
-                janeActor.Config.Crystal.MinChargeTime = 0.3
-                janeActor.Config.Crystal.MaxChargeTime = 2.5
-                janeActor.Config.Crystal.ChannelTime = 0.5
-                janeActor.Config.Crystal.ChargeSpeedMult = 1.2
-                janeActor.Config.Crystal.MaxSpeed = 250
-                janeActor.Config.Crystal.MinSpeed = 60
-            end
-        end)
+        return jd_originalFireServerConnection(self, name, channel, ...)
     end
+    jd_foreverHoldHookInstalled = true
+end
+
+local function jd_uninstallForeverHoldHook()
+    if not jd_foreverHoldHookInstalled then return end
+    local net = jd_NetworkModule
+    if net and jd_originalFireServerConnection then
+        net.FireServerConnection = jd_originalFireServerConnection
+    end
+    jd_foreverHoldHookInstalled = false
+    jd_originalFireServerConnection = nil
+end
+
+local function jd_force100UIBar()
+    pcall(function()
+        local pg = jd_lp:FindFirstChild("PlayerGui")
+        if not pg then return end
+        local tempUI = pg:FindFirstChild("TemporaryUI")
+        if not tempUI then return end
+        for _, child in ipairs(tempUI:GetChildren()) do
+            if child.Name == "ChargeUI" then
+                local bar = child:FindFirstChild("Bar")
+                if bar then
+                    local percent = bar:FindFirstChild("Percent")
+                    if percent then percent.Text = "100%" end
+                    bar.ImageColor3 = Color3.fromRGB(0, 255, 0)
+                end
+            end
+        end
+    end)
+end
+
+local function jd_foreverHoldStart()
+    if jd_foreverHoldThread then return end
+    jd_installForeverHoldHook()
+    jd_foreverHoldThread = task.spawn(function()
+        while jd_foreverHold do
+            jd_forceMaxCharge()
+            jd_force100UIBar()
+            task.wait(0.03)
+        end
+        jd_foreverHoldThread = nil
+    end)
+end
+
+local function jd_foreverHoldStop()
+    jd_foreverHold = false
+    if jd_foreverHoldThread then
+        task.cancel(jd_foreverHoldThread)
+        jd_foreverHoldThread = nil
+    end
+    jd_uninstallForeverHoldHook()
+end
+
+local function jd_getKillerVelocity(hrp)
+    if not hrp then return Vector3.zero end
+    
+    local now = tick()
+    local pos = hrp.Position
+    local data = jd_killerMotionData[hrp]
+    
+    if not data then
+        jd_killerMotionData[hrp] = {lastPos = pos, lastTime = now, velocity = Vector3.zero}
+        return Vector3.zero
+    end
+    
+    local dt = now - data.lastTime
+    if dt <= 0 then return data.velocity end
+    
+    local vel = (pos - data.lastPos) / dt
+    data.lastPos = pos
+    data.lastTime = now
+    data.velocity = vel
+    
+    return vel
 end
 
 local function jd_axeDoLock()
@@ -3062,29 +3102,6 @@ local function jd_axeDoLock()
         end)
     end)
     if not ok then warn("Failed to execute axe lock-on"); jd_axeLocked = false end
-end
-
-local function jd_getKillerVelocity(hrp)
-    if not hrp then return Vector3.zero end
-    
-    local now = tick()
-    local pos = hrp.Position
-    local data = jd_killerMotionData[hrp]
-    
-    if not data then
-        jd_killerMotionData[hrp] = {lastPos = pos, lastTime = now, velocity = Vector3.zero}
-        return Vector3.zero
-    end
-    
-    local dt = now - data.lastTime
-    if dt <= 0 then return data.velocity end
-    
-    local vel = (pos - data.lastPos) / dt
-    data.lastPos = pos
-    data.lastTime = now
-    data.velocity = vel
-    
-    return vel
 end
 
 local function jd_buildCamCF(myHRP, killerHRP, v0, g)
@@ -3177,32 +3194,6 @@ local function jd_removePatch()
     if not ok then warn("Failed to remove patch") end
 end
 
-local jd_foreverHook
-task.spawn(function()
-    while not jd_RemoteEvent do task.wait(0.5) end
-
-    local crystalInputName = jd_lp.Name .. "CrystalInput"
-
-    jd_foreverHook = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-        if method == "FireServer" and self == jd_RemoteEvent and jd_enabled and jd_foreverHold then
-            local args = {...}
-            if args[1] == crystalInputName then
-                pcall(function()
-                    local actors = require(svc.RS.Modules.Gameplay.Actors)
-                    if actors then
-                        local janeActor = actors.CurrentActors[svc.Players.LocalPlayer]
-                        if janeActor and janeActor.State then
-                            janeActor.State.CrystalFullChargeTime = os.clock() - 999
-                        end
-                    end
-                end)
-            end
-        end
-        return jd_foreverHook(self, ...)
-    end))
-end)
-
 task.spawn(function()
     while not jd_RemoteEvent do task.wait(0.5) end
 
@@ -3270,64 +3261,66 @@ sec_024:Toggle({
     end
 })
 
-local sec_024b = tabJaneDoe:Section({ Title = "Forever Hold", Opened = true })
+-- ============================================================
+-- INSTA THROW + FOREVER HOLD sections
+-- ============================================================
+
+local sec_024b = tabJaneDoe:Section({ Title = "Insta Throw", Opened = true })
 
 sec_024b:Toggle({
+    Title = "Enable Insta Throw",
+    Desc  = "Press Crystal → forces 100% charge on the same tick → game releases at max power instantly.",
+    Flag  = "jdInstaThrow",
+    Default = false,
+    Type  = "Checkbox",
+    Callback = function(on)
+        pcall(function()
+            jd_instaThrow = on
+            if on then jd_instaThrowStart() else jd_instaThrowStop() end
+        end)
+    end
+})
+
+sec_024b:Paragraph({
+    Title = "How it works",
+    Desc  = "Sets CrystalFullChargeTime to 999 seconds in the past every frame while the crystal is equipped. "
+         .. "The game's own heartbeat checks `charge >= 100%` and `held >= MaximumHoldTime`, both of which "
+         .. "become true immediately, so it fires the release at full power on the next frame."
+})
+
+local sec_024c = tabJaneDoe:Section({ Title = "Forever Hold", Opened = true })
+
+sec_024c:Toggle({
     Title = "Enable Forever Hold",
-    Desc  = "Forces Crystal charge to max (999 past input trick). Max Speed 250.",
+    Desc  = "Keeps the charge bar at 100% forever AND blocks the game's own auto-release. "
+         .. "Toggle OFF when you want to actually throw.",
     Flag  = "jdForeverHold",
     Default = false,
     Type  = "Checkbox",
     Callback = function(on)
         pcall(function()
-            if not jd_enabled then
-                if on then
-                    ui:Notify({
-                        Title = "Jane Doe Disabled",
-                        Content = "Enable 'Jane Doe Aimbot' first, then this.",
-                        Duration = 3,
-                    })
-                    return
-                end
-            end
-            jd_toggleForeverHold(on)
+            jd_foreverHold = on
+            if on then jd_foreverHoldStart() else jd_foreverHoldStop() end
         end)
     end
 })
 
-sec_024b:Slider({
-    Title = "Aim Offset (Y)",
-    Flag  = "jdHoldAimOffset",
-    Value = { Min = -5.0, Max = 5.0, Default = jd_AIM_OFFSET },
-    Step  = 0.1,
-    Callback = function(v) jd_AIM_OFFSET = v end
-})
-
-sec_024b:Slider({
-    Title = "Prediction",
-    Flag  = "jdHoldPrediction",
-    Value = { Min = 0.0, Max = 1.0, Default = jd_PREDICTION },
-    Step  = 0.01,
-    Callback = function(v) jd_PREDICTION = v end
-})
-
-sec_024b:Paragraph({
+sec_024c:Paragraph({
     Title = "How it works",
-    Desc  = "Sets CrystalFullChargeTime to 999s in the past every tick while active, "
-         .. "so the charge UI reads 100% instantly and MaxSpeed is forced to 250. "
-         .. "Also hooks the CrystalInput RemoteEvent to force max charge on every fire."
+    Desc  = "Spams CrystalFullChargeTime = os.clock() - 999 so the bar reads 100%, AND hooks "
+         .. "Network.FireServerConnection to swallow any outgoing <YourName>CrystalInput fires. "
+         .. "Game's release loop fires, we eat it, nothing happens. Toggle off = next game release "
+         .. "goes through at 100%."
 })
 
-sec_024b:Button({
+sec_024c:Button({
     Title = "Force Max Charge (One-shot)",
     Callback = function()
         pcall(function()
-            local actors = require(svc.RS.Modules.Gameplay.Actors)
-            if not actors then return end
-            local janeActor = actors.CurrentActors[svc.Players.LocalPlayer]
-            if janeActor and janeActor.State then
-                janeActor.State.CrystalFullChargeTime = os.clock() - 999
-                ui:Notify({ Title = "Charged", Content = "Crystal charge forced to max.", Duration = 2 })
+            local actor = jd_getJaneActor()
+            if actor and actor.State then
+                actor.State.CrystalFullChargeTime = os.clock() - 999
+                ui:Notify({ Title = "Charged", Content = "CrystalFullChargeTime set to past.", Duration = 2 })
             else
                 ui:Notify({ Title = "No Actor", Content = "You aren't currently Jane Doe.", Duration = 2 })
             end
@@ -3383,7 +3376,8 @@ sec_026:Button({
         jd_enabled = false
         jd_aimbotOn = false
         jd_axeEnabled = false
-        pcall(function() jd_toggleForeverHold(false) end)
+        pcall(function() jd_foreverHoldStop() end)
+        pcall(function() jd_instaThrowStop() end)
         jd_removePatch()
         if getgenv()._jdConnection then
             pcall(function() getgenv()._jdConnection:Disconnect() end)
@@ -4484,7 +4478,6 @@ local g_triggerSounds = {
     ["80540530406270"]=true, ["139523195429581"]=true,["105204810054381"]=true,["114742322778642"]=true,
     ["116468089135195"]=true,["112809109188560"]=true,["109348678063422"]=true,
     ["133709029886490"]=true,
-    -- M1 swing IDs added
     ["18511965048"]=true,["82843272472677"]=true,["12222208"]=true,
     ["106836941416453"]=true,["134720314512566"]=true,
 }
@@ -4648,7 +4641,6 @@ local function g_createConnPart()
 end
 
 local function g_updateVision()
-    -- Vision cone (existing)
     local show = guestCfg.showVisionCone or guestCfg.legacyShowVisionRange
     if not show then
         if g.centerPart then g_cleanupVision() end
@@ -4733,12 +4725,10 @@ local function g_updateVision()
     end -- root
     end -- show
     
-    -- Line Facing debug visual
     if guestCfg.showLineFacing and guestCfg.lineFacingCheck then
         local root = g_getRoot()
         local kf = g_getTeam("Killers")
         if kf and root then
-            -- hide all existing lineParts first
             for _, p in ipairs(g.lineParts) do
                 p.Transparency = 1
             end
@@ -8150,9 +8140,8 @@ function applyConfigFromFlags()
         if type(win.Flags.jdPrediction)=="number" then jd_PREDICTION=win.Flags.jdPrediction end
         if win.Flags.jdAxeEnabled ~= nil then jd_axeEnabled=win.Flags.jdAxeEnabled end
         if type(win.Flags.jdAxeLockDur)=="number" then jd_AXE_LOCK_DURATION=win.Flags.jdAxeLockDur end
-        if win.Flags.jdForeverHold ~= nil then jd_toggleForeverHold(win.Flags.jdForeverHold) end
-        if type(win.Flags.jdHoldAimOffset)=="number" then jd_AIM_OFFSET=win.Flags.jdHoldAimOffset end
-        if type(win.Flags.jdHoldPrediction)=="number" then jd_PREDICTION=win.Flags.jdHoldPrediction end
+        if win.Flags.jdInstaThrow ~= nil then jd_instaThrow=win.Flags.jdInstaThrow; if jd_instaThrow then jd_instaThrowStart() else jd_instaThrowStop() end end
+        if win.Flags.jdForeverHold ~= nil then jd_foreverHold=win.Flags.jdForeverHold; if jd_foreverHold then jd_foreverHoldStart() else jd_foreverHoldStop() end end
         if win.Flags.elliotEnabled ~= nil then elliotEnabled=win.Flags.elliotEnabled; if elliotEnabled then elliotStartAimbot() end end
         if win.Flags.elliotRequireAnim ~= nil then elliotRequireAnim=win.Flags.elliotRequireAnim end
         if win.Flags.elliotShowArc ~= nil then elliotShowArc=win.Flags.elliotShowArc end
@@ -8160,8 +8149,8 @@ function applyConfigFromFlags()
         if type(win.Flags.elliotSmoothness)=="number" then elliotSmoothness=win.Flags.elliotSmoothness end
         if type(win.Flags.elliotPredDist)=="number" then elliotPredDist=win.Flags.elliotPredDist end
         if type(win.Flags.elliotThrowForce)=="number" then elliotThrowForce=win.Flags.elliotThrowForce end
-        if win.Flags.chanceAimEnabled ~= nil then chanceAimEnabled=win.Flags.chanceAimEnabled end
-        if win.Flags.holdToAim ~= nil then holdToAim=win.Flags.holdToAim end
+        if win.Flags.chanceAimOn ~= nil then chanceAimEnabled=win.Flags.chanceAimOn end
+        if win.Flags.holdToAim ~= nil then chanceHoldToAim=win.Flags.holdToAim end
         if win.Flags.plasmaEnabled ~= nil then plasma_enabled=win.Flags.plasmaEnabled end
         if type(win.Flags.plasmaPrediction)=="number" then plasma_prediction=win.Flags.plasmaPrediction end
         if type(win.Flags.plasmaAimOffset)=="number" then plasma_aimOffset=win.Flags.plasmaAimOffset end
